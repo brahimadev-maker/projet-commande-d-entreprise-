@@ -3,24 +3,33 @@
 // les décisions d'émission. Ne remplace PAS le rejeu E4, sert juste à tester.
 //
 // Compilation : g++ -std=c++11 -Iinclude src/modes.cpp tests/test_modes.cpp -o test_modes
-// Usage       : ./test_modes <naif|fixe|s4> scenario.csv [-v]
+// Usage       : ./test_modes <naif|fixe|s4> scenario.csv [-v] [--seuil MM]
+//   -v          détaille chaque émission (heure, hauteur, période en vigueur)
+//   --seuil MM  seuil d'alerte absolu de S4 (par défaut 0 = seuil relatif)
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "modes.h"
 
 int main(int argc, char** argv) {
     Mode mode;
     if (argc < 3 || !mode_depuis_texte(argv[1], mode)) {
-        fprintf(stderr, "Usage : %s <naif|fixe|s4> scenario.csv [-v]\n", argv[0]);
+        fprintf(stderr, "Usage : %s <naif|fixe|s4> scenario.csv [-v] [--seuil MM]\n", argv[0]);
         return 1;
     }
-    bool verbeux = (argc > 3 && strcmp(argv[3], "-v") == 0);
+    bool verbeux = false;
+    ParamsModes params;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0) verbeux = true;
+        else if (strcmp(argv[i], "--seuil") == 0 && i + 1 < argc)
+            params.seuil_alerte_mm = (uint16_t)atoi(argv[++i]);
+    }
 
     FILE* f = fopen(argv[2], "r");
     if (!f) { perror(argv[2]); return 1; }
 
     EtatMode etat;
-    init_etat(etat, mode);              // mode choisi au démarrage
+    init_etat(etat, mode, params);      // mode choisi au démarrage
 
     char ligne[128];
     if (!fgets(ligne, sizeof ligne, f)) { fclose(f); return 1; }  // en-tête
@@ -37,7 +46,8 @@ int main(int argc, char** argv) {
         if (!m.valide()) nb_invalides++;
 
         if (doit_emettre(m, etat) && verbeux) {
-            if (m.valide()) printf("EMET  t=%6lus  %s  %5lu mm\n", t, date, h);
+            if (m.valide()) printf("EMET  t=%6lus  %s  %5lu mm  (periode %u min)\n",
+                                   t, date, h, (unsigned)periode_courante_min(etat));
             else            printf("EMET  t=%6lus  %s  CAPTEUR MUET\n", t, date);
         }
     }
