@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 PAS_S = 300                # pas de temps figé : 5 min
 TROU_MAX_INTERP_S = 1800   # trou <= 30 min : interpolation linéaire
+SAUT_MAX_MM = 300          # pic isolé de plus de 300 mm : valeur aberrante
 INVALIDE = 65535           # = MESURE_INVALIDE (0xFFFF) de mesure.h
 UTC = timezone.utc
 FORMATS = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S",
@@ -172,8 +173,12 @@ def cmd_chercher(args):
                         for j in range(len(pts) - 1))
         if ecarts[len(ecarts) // 2] > 360:          # pas médian > 6 min
             continue
-        vals = [v for _, v in pts]
-        amplitude = max(vals) - min(vals)
+        propres, _ = retirer_aberrantes(sorted(pts), SAUT_MAX_MM)
+        vals = [v for _, v in propres]
+        if max(vals) > INVALIDE - 1:                # hauteurs en altitude : hors uint16
+            print(f"  [{i}/{len(stations)}] {code} ignorée (hauteurs > 65,5 m)")
+            continue
+        amplitude = max(vals) - min(vals)          # montée sans les pics faux
         resultats.append((amplitude, code, nom, pts))
         print(f"  [{i}/{len(stations)}] {code} {nom[:40]:<40} "
               f"montée {amplitude / 1000:.2f} m")
@@ -191,12 +196,46 @@ def cmd_chercher(args):
         sortie = f"scenario_{n:02d}_{code}.csv"
         ecrire(grille, sortie)
         print(f"\n{sortie} : {nom}, montée {amp / 1000:.2f} m, "
+              f"{rap['aberrantes']} aberrantes retirées, "
               f"{rap['interpolees']} interpolées, {rap['invalides']} invalides")
         valider(sortie)
 
 
 # ---------------------------------------------------------------- nettoyage
-def nettoyer(points, debut=None, fin=None):
+def retirer_aberrantes(pts, saut_max, longueur_max=3):
+    """Retire les pics courts : 1 à longueur_max mesures consécutives qui
+    s'écartent toutes de plus de saut_max de la mesure d'avant ET de celle
+    d'après, dans le même sens, alors que l'eau retrouve ensuite son niveau
+    (exemple : 5099, 5, 5, 5073). Une vraie crue monte de façon continue et
+    ne revient pas aussitôt à son niveau : elle n'est donc pas touchée.
+    Renvoie (points gardés, nombre de mesures retirées)."""
+    if saut_max <= 0 or len(pts) < 3:
+        return pts, 0
+    garde, retires, i = [pts[0]], 0, 1
+    while i < len(pts) - 1:
+        prec = garde[-1][1]
+        pic = 0
+        for k in range(1, longueur_max + 1):
+            if i + k >= len(pts):
+                break
+            suiv = pts[i + k][1]
+            serie = [v for _, v in pts[i:i + k]]
+            if abs(prec - suiv) <= saut_max and all(
+                    abs(v - prec) > saut_max and abs(v - suiv) > saut_max
+                    and (v - prec) * (v - suiv) > 0 for v in serie):
+                pic = k
+                break
+        if pic:
+            retires += pic
+            i += pic
+        else:
+            garde.append(pts[i])
+            i += 1
+    garde += pts[i:]
+    return garde, retires
+
+
+def nettoyer(points, debut=None, fin=None, saut_max=SAUT_MAX_MM):
     """Trie, dédoublonne, recale sur une grille de 5 min, comble les petits
     trous, marque les grands trous INVALIDE. Renvoie (grille, rapport)."""
     uniques = {}
@@ -209,12 +248,14 @@ def nettoyer(points, debut=None, fin=None):
         pts = [p for p in pts if p[0] <= fin]
     if len(pts) < 2:
         raise SystemExit("Pas assez de mesures dans l'intervalle choisi.")
+    pts, nb_aberrantes = retirer_aberrantes(pts, saut_max)
 
     temps = [p[0].timestamp() for p in pts]
     valeurs = [p[1] for p in pts]
     t0 = -(-int(temps[0]) // PAS_S) * PAS_S          # arrondi au 5 min supérieur
     t_fin = int(temps[-1]) // PAS_S * PAS_S
-    rapport = {"interpolees": 0, "invalides": 0, "negatives": 0}
+    rapport = {"interpolees": 0, "invalides": 0, "negatives": 0,
+               "aberrantes": nb_aberrantes}
     grille = []
     t = t0
     while t <= t_fin:
@@ -237,7 +278,11 @@ def nettoyer(points, debut=None, fin=None):
             if h < 0:                     # uint16 : pas de hauteur négative
                 h = 0
                 rapport["negatives"] += 1
-            h = min(h, INVALIDE - 1)
+            if h > INVALIDE - 1:
+                raise SystemExit(
+                    f"Hauteur de {h} mm hors plage (max {INVALIDE - 1} mm) : cette "
+                    "station exprime ses hauteurs en altitude, elle est incompatible "
+                    "avec le format (uint16). Choisis une autre station.")
         grille.append((t - t0, datetime.fromtimestamp(t, UTC), h))
         t += PAS_S
     return grille, rapport
@@ -255,10 +300,11 @@ def cmd_nettoyer(args):
     fin = lire_date(args.fin) if args.fin else None
     points = lire_brut(args.brut, args.unite, args.heure_locale)
     print(f"{len(points)} mesures lues dans {args.brut}")
-    grille, r = nettoyer(points, debut, fin)
+    grille, r = nettoyer(points, debut, fin, args.saut_max)
     ecrire(grille, args.sortie)
     print(f"{len(grille)} lignes -> {args.sortie}  "
-          f"(interpolées : {r['interpolees']}, invalides : {r['invalides']}, "
+          f"(aberrantes retirées : {r['aberrantes']}, "
+          f"interpolées : {r['interpolees']}, invalides : {r['invalides']}, "
           f"négatives ramenées à 0 : {r['negatives']})")
     valider(args.sortie)
 
@@ -336,6 +382,8 @@ if __name__ == "__main__":
                    help="unité de la hauteur dans le fichier brut")
     a.add_argument("--heure-locale", action="store_true",
                    help="les dates du brut sont en heure française")
+    a.add_argument("--saut-max", type=int, default=SAUT_MAX_MM,
+                   help="pic isolé (mm) considéré comme aberrant ; 0 = désactivé")
     a.set_defaults(f=cmd_nettoyer)
 
     a = sp.add_parser("valider", help="vérifier un ou plusieurs scénarios")
