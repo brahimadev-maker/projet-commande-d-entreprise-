@@ -3,7 +3,7 @@
 #include <string.h>
 
 // Mémorise une émission (appelé quand une version décide d'émettre).
-static bool emettre(const Mesure& m, EtatMode& e) {
+static bool memoriser_envoi(const Mesure& m, EtatMode& e) {
     e.deja_emis       = true;
     e.t_dernier_envoi = m.t_s;
     e.h_dernier_envoi = m.hauteur_mm;
@@ -15,7 +15,7 @@ static bool emettre(const Mesure& m, EtatMode& e) {
 // Mode NAÏF : émet chaque mesure valide.
 bool doit_emettre_naif(const Mesure& m, EtatMode& e) {
     if (!m.valide()) return false;
-    return emettre(m, e);
+    return memoriser_envoi(m, e);
 }
 
 // ---------------------------------------------------------------------------
@@ -24,14 +24,16 @@ bool doit_emettre_naif(const Mesure& m, EtatMode& e) {
 bool doit_emettre_fixe(const Mesure& m, EtatMode& e) {
     if (!m.valide()) return false;
     if (!e.deja_emis || m.t_s - e.t_dernier_envoi >= e.p.periode_fixe_s)
-        return emettre(m, e);
+        return memoriser_envoi(m, e);
     return false;
 }
 
 // ---------------------------------------------------------------------------
 // Mode S4 HYBRIDE : périodique lent + événements.
-// Seuil d'alerte RELATIF : niveau de base (plus basse hauteur vue depuis le
-// début) + s4_marge_alerte_mm. S'adapte ainsi automatiquement à chaque station.
+// Seuil d'alerte : seuil_alerte_mm s'il est renseigné (seuil absolu, par
+// exemple issu du fichier de seuils par site) ; sinon (0) seuil RELATIF :
+// niveau de base (plus basse hauteur vue depuis le début) + s4_marge_alerte_mm,
+// qui s'adapte automatiquement au zéro d'échelle de chaque station.
 // Émet si : 1re mesure, retour du capteur, entrée/sortie d'alerte,
 // variation >= delta depuis le dernier envoi, ou période écoulée
 // (courte en alerte, longue sinon). Signale une fois un capteur muet
@@ -58,7 +60,9 @@ bool doit_emettre_s4(const Mesure& m, EtatMode& e) {
     // Niveau de base : la plus basse hauteur vue jusqu'ici
     if (m.hauteur_mm < e.niveau_base)
         e.niveau_base = m.hauteur_mm;
-    uint32_t seuil = (uint32_t)e.niveau_base + p.s4_marge_alerte_mm;
+    uint32_t seuil = p.seuil_alerte_mm
+                   ? (uint32_t)p.seuil_alerte_mm
+                   : (uint32_t)e.niveau_base + p.s4_marge_alerte_mm;
 
     // Alerte avec hystérésis (évite d'osciller autour du seuil)
     bool alerte_avant = e.en_alerte;
@@ -77,7 +81,7 @@ bool doit_emettre_s4(const Mesure& m, EtatMode& e) {
         || e.en_alerte != alerte_avant
         || variation >= (int32_t)p.s4_delta_mm
         || m.t_s - e.t_dernier_envoi >= periode)
-        return emettre(m, e);
+        return memoriser_envoi(m, e);
 
     return false;
 }
@@ -90,6 +94,16 @@ bool doit_emettre(const Mesure& m, EtatMode& e) {
         case Mode::S4:   return doit_emettre_s4(m, e);
     }
     return false;
+}
+
+uint32_t periode_courante_min(const EtatMode& e) {
+    switch (e.mode) {
+        case Mode::NAIF: return PAS_MESURE_S / 60;
+        case Mode::FIXE: return e.p.periode_fixe_s / 60;
+        case Mode::S4:   return (e.en_alerte ? e.p.s4_periode_alerte_s
+                                             : e.p.s4_periode_calme_s) / 60;
+    }
+    return 0;
 }
 
 void init_etat(EtatMode& e, Mode mode, const ParamsModes& p) {
